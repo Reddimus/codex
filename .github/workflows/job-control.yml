@@ -1,5 +1,7 @@
 name: Job control
 
+# Hosted-runner validation for this fork; upstream CI uses private runner groups.
+
 on:
   pull_request:
     paths:
@@ -9,6 +11,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: job-control-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   tui:
@@ -38,6 +44,10 @@ jobs:
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
           tool: just@1.58.0,cargo-nextest@0.9.146
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: codex-rs
+          prefix-key: job-control
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
@@ -54,6 +64,7 @@ jobs:
             echo "Native hosted runner: $RUNNER_OS / $RUNNER_ARCH"
             uname -a
             rustc --version
-            echo "PTY regression: 100 cycles, two background resumes per cycle."
+            echo "Configured PTY regression: 100 cycles, two background resumes per cycle."
+            echo "See the test step for its result."
             echo "No Kettle window, physical display, or GPU was exercised in this job."
           } >> "$GITHUB_STEP_SUMMARY"
