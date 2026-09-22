@@ -1,4 +1,7 @@
 //! Restore terminal modes and screen placement across suspend/resume.
+//!
+//! A background continue leaves the interactive TUI stopped until `fg` grants
+//! terminal ownership; it must not reinstall input modes over the shell.
 
 use std::io::Result;
 use std::io::stdout;
@@ -19,6 +22,10 @@ use ratatui::layout::Size;
 use crate::key_hint;
 
 use super::Terminal;
+
+#[cfg(test)]
+#[path = "job_control_tests.rs"]
+mod tests;
 
 pub const SUSPEND_KEY: key_hint::KeyBinding = key_hint::ctrl(KeyCode::Char('z'));
 
@@ -204,9 +211,35 @@ impl PreparedResumeAction {
 fn suspend_process() -> Result<()> {
     super::restore()?;
     super::terminal_stderr::pause()?;
-    unsafe {
-        libc::kill(/*pid*/ 0, libc::SIGTSTP)
-    };
+    // A process-directed signal can stop another thread after this worker has
+    // already restored raw mode. raise delivers to this worker before returning;
+    // the stop still suspends the whole process.
+    // SAFETY: SIGTSTP is a valid signal and requires no pointer arguments.
+    if unsafe { libc::raise(libc::SIGTSTP) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    loop {
+        // SAFETY: these calls only query terminal and process-group ownership.
+        let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+        if foreground == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Startup requires terminal stdin. If it has gone away, leave
+            // modes disabled instead of writing without confirmed ownership.
+            return Err(error);
+        }
+        if foreground == unsafe { libc::getpgrp() } {
+            break;
+        }
+        // `bg` sends SIGCONT without granting the terminal. Remain stopped until
+        // `fg`; SIGSTOP cannot be ignored by an inherited signal disposition.
+        // SAFETY: SIGSTOP is a valid signal and requires no pointer arguments.
+        if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
     // After the process resumes, reapply terminal modes so drawing can continue.
     super::terminal_stderr::resume()?;
     super::set_modes()?;

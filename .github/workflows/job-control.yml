@@ -1,0 +1,70 @@
+name: Job control
+
+# Hosted-runner validation for this fork; upstream CI uses private runner groups.
+
+on:
+  pull_request:
+    paths:
+      - "codex-rs/tui/**"
+      - ".github/workflows/job-control.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: job-control-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tui:
+    if: github.repository == 'Reddimus/codex'
+    name: TUI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      RUST_MIN_STACK: "8388608"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: just@1.58.0,cargo-nextest@0.9.146
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: codex-rs
+          prefix-key: job-control
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --locked -p codex-tui --tests -- -D warnings
+      - name: TUI tests including 100 suspend/resume cycles
+        run: just test --locked -p codex-tui
+      - name: Build TUI
+        run: cargo build --locked -p codex-tui --bin codex-tui
+      - name: Test environment
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "Native hosted runner: $RUNNER_OS / $RUNNER_ARCH"
+            uname -a
+            rustc --version
+            echo "Configured PTY regression: 100 cycles, two background resumes per cycle."
+            echo "See the test step for its result."
+            echo "No Kettle window, physical display, or GPU was exercised in this job."
+          } >> "$GITHUB_STEP_SUMMARY"
