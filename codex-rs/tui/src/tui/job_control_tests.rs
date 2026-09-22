@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Read;
+use std::io::Write;
 use std::mem::MaybeUninit;
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
@@ -79,16 +80,23 @@ fn suspension_preserves_shell_modes_until_foreground_resume() {
         });
     }
     let mut driver = OwnedChild(command.spawn().expect("spawn session leader"));
+    // Command retains its slave descriptors until dropped, preventing PTY EOF.
     drop(command);
-    // Drain the PTY without retaining unbounded output or blocking fixture writes.
+    // Keep a bounded trace while continuing to drain oversized output.
     let reader = std::thread::spawn(move || {
         let mut master = master;
         let mut buffer = [0; 4096];
+        let mut output = Vec::new();
+        let mut truncated = false;
         while let Ok(count) = master.read(&mut buffer) {
             if count == 0 {
                 break;
             }
+            let keep = count.min((1024 * 1024usize).saturating_sub(output.len()));
+            output.extend_from_slice(&buffer[..keep]);
+            truncated |= keep != count;
         }
+        (output, truncated)
     });
     let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
@@ -108,7 +116,7 @@ fn suspension_preserves_shell_modes_until_foreground_resume() {
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    reader.join().expect("PTY reader");
+    let (output, truncated) = reader.join().expect("PTY reader");
     let mut errors = String::new();
     driver
         .0
@@ -118,6 +126,60 @@ fn suspension_preserves_shell_modes_until_foreground_resume() {
         .read_to_string(&mut errors)
         .unwrap();
     assert!(status.success(), "job-control fixture failed: {errors}");
+    assert!(!truncated, "PTY trace exceeded its size limit");
+    assert_keyboard_ownership(&output);
+}
+
+fn assert_keyboard_ownership(output: &[u8]) {
+    let trace = String::from_utf8_lossy(output);
+    let events = regex_lite::Regex::new(
+        r"\x1b\[([><])(\d*)u|JOB_CONTROL_(STOP|FG|RESUMED)_(\d+)|\x1b\[\?(?:1049|1|2004|1004)h",
+    )
+    .unwrap();
+    let mut stack = vec![0u32];
+    let mut shell_owns_terminal = false;
+    let mut stops = 0;
+    let mut resumes = 0;
+    for event in events.captures_iter(&trace) {
+        if let Some(operation) = event.get(1) {
+            let value = event[2].parse::<u32>().unwrap_or(1);
+            if operation.as_str() == ">" {
+                assert!(!shell_owns_terminal, "keyboard push while suspended");
+                stack.push(value);
+            } else {
+                let keep = stack.len().saturating_sub(value as usize).max(1);
+                stack.truncate(keep);
+            }
+        } else if let Some(marker) = event.get(3) {
+            match marker.as_str() {
+                "STOP" => {
+                    assert_eq!(*stack.last().unwrap(), 0, "shell inherited Kitty flags");
+                    shell_owns_terminal = true;
+                    stops += 1;
+                }
+                "FG" => shell_owns_terminal = false,
+                "RESUMED" => {
+                    assert_ne!(*stack.last().unwrap(), 0, "Kitty flags not restored");
+                    resumes += 1;
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            assert!(
+                !shell_owns_terminal,
+                "terminal mode enabled while suspended"
+            );
+        }
+    }
+    assert_eq!(stops, CYCLES * 3);
+    assert_eq!(resumes, CYCLES);
+    assert_eq!(*stack.last().unwrap(), 0, "final keyboard restore");
+}
+
+fn marker(kind: &str, cycle: usize) {
+    let mut stdout = std::io::stdout();
+    writeln!(stdout, "JOB_CONTROL_{kind}_{cycle}").unwrap();
+    stdout.flush().unwrap();
 }
 
 fn wait_stopped(pid: libc::pid_t) {
@@ -200,6 +262,7 @@ fn job_control_driver() {
 
     for cycle in 0..CYCLES {
         wait_stopped(pid);
+        marker("STOP", cycle);
         assert_shell_modes(&original);
         assert!(!directory.join(format!("resumed-{cycle}")).exists());
         // SAFETY: getpgrp returns this session leader's process group.
@@ -209,13 +272,21 @@ fn job_control_driver() {
             // SAFETY: pid remains an owned child, retained until the end.
             assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
             wait_stopped(pid);
+            marker("STOP", cycle);
             assert_shell_modes(&original);
             assert!(!directory.join(format!("resumed-{cycle}")).exists());
         }
         // SAFETY: emulate fg: grant the terminal before continuing the job.
+        marker("FG", cycle);
         assert_eq!(unsafe { libc::tcsetpgrp(0, pid) }, 0);
         assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
         wait_for(&directory.join(format!("resumed-{cycle}")));
+        marker("RESUMED", cycle);
+        assert_eq!(
+            termios().c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG),
+            0,
+            "foreground TUI did not restore raw mode"
+        );
         std::fs::write(directory.join(format!("next-{cycle}")), []).unwrap();
     }
     wait_for(&directory.join("finished"));
@@ -231,6 +302,8 @@ fn job_control_worker() {
     };
     let directory = std::path::PathBuf::from(directory);
     wait_for(&directory.join("start"));
+    // Keep the process leader parked while a worker suspends, reproducing the
+    // process-directed delivery race rather than testing only the main thread.
     std::thread::spawn(move || {
         super::super::set_modes().expect("initial terminal modes");
         for cycle in 0..CYCLES {

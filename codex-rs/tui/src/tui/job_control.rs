@@ -1,4 +1,7 @@
 //! Restore terminal modes and screen placement across suspend/resume.
+//!
+//! A background continue leaves the interactive TUI stopped until `fg` grants
+//! terminal ownership; it must not reinstall input modes over the shell.
 
 use std::io::Result;
 use std::io::stdout;
@@ -209,16 +212,23 @@ fn suspend_process() -> Result<()> {
     super::restore()?;
     super::terminal_stderr::pause()?;
     // A process-directed signal can stop another thread after this worker has
-    // already restored raw mode. raise delivers the stop to this calling thread.
+    // already restored raw mode. raise delivers to this worker before returning;
+    // the stop still suspends the whole process.
     // SAFETY: SIGTSTP is a valid signal and requires no pointer arguments.
     if unsafe { libc::raise(libc::SIGTSTP) } != 0 {
-        return Err(std::io::Error::other("failed to raise SIGTSTP"));
+        return Err(std::io::Error::last_os_error());
     }
     loop {
         // SAFETY: these calls only query terminal and process-group ownership.
         let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
         if foreground == -1 {
-            return Err(std::io::Error::last_os_error());
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Startup requires terminal stdin. If it has gone away, leave
+            // modes disabled instead of writing without confirmed ownership.
+            return Err(error);
         }
         if foreground == unsafe { libc::getpgrp() } {
             break;
@@ -227,7 +237,7 @@ fn suspend_process() -> Result<()> {
         // `fg`; SIGSTOP cannot be ignored by an inherited signal disposition.
         // SAFETY: SIGSTOP is a valid signal and requires no pointer arguments.
         if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
-            return Err(std::io::Error::other("failed to raise SIGSTOP"));
+            return Err(std::io::Error::last_os_error());
         }
     }
     // After the process resumes, reapply terminal modes so drawing can continue.
