@@ -211,19 +211,25 @@ fn termios() -> libc::termios {
 
 fn assert_shell_modes(expected: &libc::termios) {
     let actual = termios();
+    // Darwin sets PENDIN itself when raw input returns to canonical mode.
+    // It is transient queue state, not a client-owned terminal setting.
+    #[cfg(target_os = "macos")]
+    let transient_flags = libc::PENDIN;
+    #[cfg(not(target_os = "macos"))]
+    let transient_flags = 0;
     assert_eq!(
         (
             actual.c_iflag,
             actual.c_oflag,
             actual.c_cflag,
-            actual.c_lflag,
+            actual.c_lflag & !transient_flags,
             actual.c_cc
         ),
         (
             expected.c_iflag,
             expected.c_oflag,
             expected.c_cflag,
-            expected.c_lflag,
+            expected.c_lflag & !transient_flags,
             expected.c_cc
         ),
         "suspended/background TUI changed the foreground shell's terminal modes"
