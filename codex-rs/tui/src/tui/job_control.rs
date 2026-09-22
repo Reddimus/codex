@@ -20,6 +20,10 @@ use crate::key_hint;
 
 use super::Terminal;
 
+#[cfg(test)]
+#[path = "job_control_tests.rs"]
+mod tests;
+
 pub const SUSPEND_KEY: key_hint::KeyBinding = key_hint::ctrl(KeyCode::Char('z'));
 
 /// Coordinates suspend/resume handling so the TUI can restore terminal context after SIGTSTP.
@@ -204,9 +208,28 @@ impl PreparedResumeAction {
 fn suspend_process() -> Result<()> {
     super::restore()?;
     super::terminal_stderr::pause()?;
-    unsafe {
-        libc::kill(/*pid*/ 0, libc::SIGTSTP)
-    };
+    // A process-directed signal can stop another thread after this worker has
+    // already restored raw mode. raise delivers the stop to this calling thread.
+    // SAFETY: SIGTSTP is a valid signal and requires no pointer arguments.
+    if unsafe { libc::raise(libc::SIGTSTP) } != 0 {
+        return Err(std::io::Error::other("failed to raise SIGTSTP"));
+    }
+    loop {
+        // SAFETY: these calls only query terminal and process-group ownership.
+        let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+        if foreground == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if foreground == unsafe { libc::getpgrp() } {
+            break;
+        }
+        // `bg` sends SIGCONT without granting the terminal. Remain stopped until
+        // `fg`; SIGSTOP cannot be ignored by an inherited signal disposition.
+        // SAFETY: SIGSTOP is a valid signal and requires no pointer arguments.
+        if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+            return Err(std::io::Error::other("failed to raise SIGSTOP"));
+        }
+    }
     // After the process resumes, reapply terminal modes so drawing can continue.
     super::terminal_stderr::resume()?;
     super::set_modes()?;
